@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Dazai’s Battlefield – EXTENDED REUNION</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:#000}
+  canvas{display:block;touch-action:none}
+  #dpad{position:absolute;left:20px;bottom:20px;width:120px;height:120px;opacity:.8}
+  .arrow{position:absolute;width:40px;height:40px;background:rgba(255,255,255,.3);border-radius:8px;
+         display:flex;align-items:center;justify-content:center;font-size:24px;color:#fff;user-select:none}
+  #up{top:0;left:40px}#down{bottom:0;left:40px}#left{left:0;top:40px}#right{right:0;top:40px}
+  #joystick-container{position:absolute;right:20px;bottom:20px;width:120px;height:120px}
+  #joystick-base{position:absolute;width:100px;height:100px;background:rgba(255,255,255,.15);border-radius:50%;left:10px;top:10px}
+  #joystick-knob{position:absolute;width:50px;height:50px;background:rgba(255,255,255,.4);border-radius:50%;left:35px;top:35px}
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<div id="dpad">
+  <div class="arrow" id="up">Up</div>
+  <div class="arrow" id="down">Down</div>
+  <div class="arrow" id="left">Left</div>
+  <div class="arrow" id="right">Right</div>
+</div>
+
+<div id="joystick-container">
+  <div id="joystick-base"></div>
+  <div id="joystick-knob"></div>
+</div>
+
+<script>
+/* ───────────────────── CONFIG ───────────────────── */
+const WORLD = {w:3000, h:3000};
+const PLAYER = {hitSize:48, drawSize:96, speed:16};
+const ENEMY = {size:40, speed:1.2};
+const BULLET = {size:6, speed:12, fireRate:70};
+const TOTAL_ENEMIES = 40;
+const KILL_GOAL = 30;
+const OBSTACLE_COUNT = 80;
+const MARKER = {x:WORLD.w-200, y:150};
+const FRIEND_OFFSET = {x:80, y:0};
+const PLAYER_MAX_HP = 5;
+let playerHP = PLAYER_MAX_HP;
+
+/* ───────────────────── CANVAS ───────────────────── */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+function resize(){canvas.width=innerWidth;canvas.height=innerHeight}
+resize(); addEventListener('resize',resize);
+
+/* ───────────────────── STATE ───────────────────── */
+let state = 'start';
+let player, enemies=[], bullets=[], obstacles=[], marker, friend;
+let kills = 0;
+let cam = {x:0,y:0,targetX:0,targetY:0,lerp:0.12};
+let keys = {};
+let joy = {active:false, angle:0, power:0, id:null, bx:0, by:0};
+
+/* ───────────────────── FALLBACK IMAGES ───────────────────── */
+function fb(c,s,t=''){const v=document.createElement('canvas');v.width=s;v.height=s;const x=v.getContext('2d');x.fillStyle=c;x.fillRect(0,0,s,s);if(t){x.fillStyle='#fff';x.font='12px Arial';x.textAlign='center';x.fillText(t,s/2,s/2+4);}return v;}
+const imgs = {'Dazai.png':fb('#8B4513',PLAYER.drawSize,'D'),'enemy.png':fb('#c00',40,'E'),'friend.png':fb('#0f0',48,'F')};
+['Dazai.png','enemy.png','friend.png'].forEach(n=>{const i=new Image();i.onload=_=>imgs[n]=i;i.src=n+'?t='+Date.now();});
+
+/* ───────────────────── PLAYER ───────────────────── */
+class Player{
+  constructor(){this.x=WORLD.w/2;this.y=WORLD.h/2;this.w=PLAYER.hitSize;this.h=PLAYER.hitSize;this.last=0;}
+  update(){
+    let dx=0,dy=0;
+    if(keys.up)dy-=1; if(keys.down)dy+=1; if(keys.left)dx-=1; if(keys.right)dx+=1;
+    if(dx||dy){
+      const len=Math.hypot(dx,dy);
+      dx=dx/len*PLAYER.speed; dy=dy/len*PLAYER.speed;
+    }
+    this.move(dx,dy);
+    cam.targetX=this.x; cam.targetY=this.y;
+    if(joy.power>0.3 && Date.now()-this.last>BULLET.fireRate){
+      bullets.push(new Bullet(this.x,this.y,joy.angle)); this.last=Date.now();
+    }
+  }
+  move(dx,dy){
+    let newX = this.x + dx;
+    let newY = this.y + dy;
+    const margin = 10;
+    if (newX - this.w/2 >= margin && newX + this.w/2 <= WORLD.w - margin && !this.coll(newX, this.y)) this.x = newX;
+    if (newY - this.h/2 >= margin && newY + this.h/2 <= WORLD.h - margin && !this.coll(this.x, newY)) this.y = newY;
+  }
+  coll(x,y){return obstacles.some(o=>rectColl({x,y,w:this.w,h:this.h},o));}
+  draw(cx,cy){
+    const drawW = PLAYER.drawSize;
+    const drawH = PLAYER.drawSize;
+    ctx.drawImage(imgs['Dazai.png'], this.x-cx-drawW/2, this.y-cy-drawH/2, drawW, drawH);
+  }
+}
+
+/* ───────────────────── ENEMY ───────────────────── */
+class Enemy{
+  constructor(){this.w=ENEMY.size;this.h=ENEMY.size;this.respawn();}
+  respawn(){
+    do{this.x=Math.random()*(WORLD.w-200)+100;this.y=Math.random()*(WORLD.h-200)+100;}
+    while(this.coll(this.x,this.y)||dist(this.x,this.y,player.x,player.y)<300);
+    this.dead=false; this.cd=0;
+  }
+  update(){
+    if(this.dead)return;
+    const dx=player.x-this.x, dy=player.y-this.y, l=Math.hypot(dx,dy);
+    if(l){this.x+=dx/l*ENEMY.speed; this.y+=dy/l*ENEMY.speed;}
+    if(this.coll(this.x,this.y)) this.nudge();
+    this.x = Math.max(this.w/2 + 10, Math.min(WORLD.w - this.w/2 - 10, this.x));
+    this.y = Math.max(this.h/2 + 10, Math.min(WORLD.h - this.h/2 - 10, this.y));
+    if(this.cd<=0 && dist(this.x,this.y,player.x,player.y)<(this.w+PLAYER.hitSize)/2){
+      playerHP--; this.cd=30;
+      if(playerHP<=0) gameOver();
+    }
+    if(this.cd>0) this.cd--;
+  }
+  nudge(){for(let i=0;i<8;i++){const a=i*Math.PI/4,tx=this.x+Math.cos(a)*2,ty=this.y+Math.sin(a)*2;if(!this.coll(tx,ty)){this.x=tx;this.y=ty;break;}}}
+  coll(x,y){return obstacles.some(o=>rectColl({x,y,w:this.w,h:this.h},o));}
+  draw(cx,cy){if(this.dead)return;ctx.drawImage(imgs['enemy.png'],this.x-cx-this.w/2,this.y-cy-this.h/2,this.w,this.h);}
+}
+
+/* ───────────────────── BULLET ───────────────────── */
+class Bullet{
+  constructor(x,y,a){this.x=x;this.y=y;this.w=BULLET.size;this.h=BULLET.size;
+    this.vx=Math.cos(a)*BULLET.speed; this.vy=Math.sin(a)*BULLET.speed;}
+  update(){
+    this.x+=this.vx; this.y+=this.vy;
+    if(this.x<0||this.x>WORLD.w||this.y<0||this.y>WORLD.h) return false;
+    const r={x:this.x-this.w/2,y:this.y-this.h/2,w:this.w,h:this.h};
+    if(obstacles.some(o=>rectColl(r,o))) return false;
+    for(let i=enemies.length-1;i>=0;i--){
+      const e=enemies[i];
+      if(!e.dead&&rectColl(r,{x:e.x-e.w/2,y:e.y-e.h/2,w:e.w,h:e.h})){
+        e.dead=true; kills++; if(kills===KILL_GOAL) spawnMarker(); return false;
+      }
+    }
+    return true;
+  }
+  draw(cx,cy){ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(this.x-cx,this.y-cy,this.w/2,0,Math.PI*2);ctx.fill();}
+}
+
+/* ───────────────────── OBSTACLE ───────────────────── */
+class Obstacle{
+  constructor(){
+    this.w=60+Math.random()*140; this.h=60+Math.random()*140;
+    do{this.x=Math.random()*(WORLD.w-this.w);this.y=Math.random()*(WORLD.h-this.h);}
+    while(dist(this.x+this.w/2,this.y+this.h/2,player.x,player.y)<400);
+  }
+  draw(cx,cy){ctx.fillStyle='#800080';ctx.fillRect(this.x-cx,this.y-cy,this.w,this.h);}
+}
+
+/* ───────────────────── HELPERS ───────────────────── */
+function rectColl(a,b){return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;}
+function dist(x1,y1,x2,y2){return Math.hypot(x1-x2,y1-y2);}
+
+/* ───────────────────── GAME LOGIC ───────────────────── */
+function startGame(){
+  playerHP=PLAYER_MAX_HP; player=new Player();
+  enemies=Array.from({length:TOTAL_ENEMIES},()=>new Enemy());
+  bullets=[]; obstacles=Array.from({length:OBSTACLE_COUNT},()=>new Obstacle());
+  marker=null; friend=null; kills=0; state='playing';
+}
+function spawnMarker(){
+  marker={x:MARKER.x,y:MARKER.y,w:40,h:40};
+  friend={x:MARKER.x+FRIEND_OFFSET.x,y:MARKER.y+FRIEND_OFFSET.y,w:48,h:48,visible:false};
+}
+function checkMarker(){
+  if(marker && dist(player.x,player.y,marker.x,marker.y)<80){
+    friend.visible=true;
+    endGame(); // Now waits 5.8s before message
+  }
+}
+function endGame(){
+  state='ended';
+  setTimeout(showMessage, 5800); // EXTENDED BY 4 SECONDS
+}
+function showMessage(){
+  const d=document.createElement('div');
+  d.innerHTML=`<div style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100">
+    <div style="background:#111;color:#fff;padding:30px 40px;max-width:90%;font:18px Arial;line-height:1.8;text-align:center;border:2px solid #444;border-radius:12px">
+      Well, happy birthday, Shahinaan.<br>
+      You’ve been an amazing friend from day one, and somehow even evolved into my best friend.<br>
+      TBH, I’m just glad you found a jewel of a friend like me.<br>
+      Jokes aside, I know the game’s not all polished (my fault there),<br>
+      but at least accept it.
+    </div></div>`;
+  document.body.appendChild(d);
+}
+function gameOver(){
+  state='gameover';
+  const d=document.createElement('div');
+  d.innerHTML=`<div style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.9);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:100;color:#fff;font:28px Arial">
+    <div>GAME OVER</div><div style="margin:20px">Kills: ${kills}</div>
+    <button onclick="location.reload()" style="padding:15px 40px;font:20px Arial;background:#c00;color:#fff;border:none;border-radius:10px;cursor:pointer">Try Again</button>
+  </div>`;
+  document.body.appendChild(d);
+}
+
+/* ───────────────────── UI ───────────────────── */
+function drawHP(){
+  const w=200,h=20,x=20,y=70;
+  ctx.fillStyle='#333';ctx.fillRect(x-2,y-2,w+4,h+4);
+  ctx.fillStyle='#c00';ctx.fillRect(x,y,w,h);
+  ctx.fillStyle='#0f0';ctx.fillRect(x,y,w*(playerHP/PLAYER_MAX_HP),h);
+  ctx.fillStyle='#fff';ctx.font='18px Arial';ctx.fillText(`HP: ${playerHP}`,x+5,y+h-3);
+}
+function drawMinimap(){
+  const sz=120,sc=sz/WORLD.w,ox=canvas.width-sz-20,oy=20;
+  ctx.strokeStyle='#444';ctx.lineWidth=2;ctx.strokeRect(ox,oy,sz,sz);
+  ctx.fillStyle='#800080';obstacles.forEach(o=>ctx.fillRect(ox+o.x*sc,oy+o.y*sc,o.w*sc,o.h*sc));
+  ctx.fillStyle='#8B4513';ctx.beginPath();ctx.arc(ox+player.x*sc,oy+player.y*sc,4,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#c00';enemies.forEach(e=>{if(!e.dead){ctx.beginPath();ctx.arc(ox+e.x*sc,oy+e.y*sc,3,0,Math.PI*2);ctx.fill();}});
+  if(marker){ctx.fillStyle='#ff0';ctx.beginPath();ctx.arc(ox+marker.x*sc,oy+marker.y*sc,4,0,Math.PI*2);ctx.fill();}
+  if(friend&&friend.visible){ctx.fillStyle='#0f0';ctx.beginPath();ctx.arc(ox+friend.x*sc,oy+friend.y*sc,4,0,Math.PI*2);ctx.fill();}
+}
+
+/* ───────────────────── MAIN LOOP ───────────────────── */
+let last=0;
+function loop(t){
+  ctx.fillStyle='#000';ctx.fillRect(0,0,canvas.width,canvas.height);
+  if(state==='start'){
+    ctx.fillStyle='#fff';ctx.font='36px Arial';ctx.textAlign='center';
+    ctx.fillText('Tap to Start',canvas.width/2,canvas.height/2);
+    requestAnimationFrame(loop);return;
+  }
+  if(state==='playing' || state==='ended'){
+    cam.x+=(cam.targetX-cam.x)*cam.lerp;
+    cam.y+=(cam.targetY-cam.y)*cam.lerp;
+    if(state==='playing') player.update();
+    enemies.forEach(e=>e.update());
+    bullets=bullets.filter(b=>b.update());
+    if(state==='playing') checkMarker();
+
+    const cx=cam.x-canvas.width/2, cy=cam.y-canvas.height/2;
+    obstacles.forEach(o=>o.draw(cx,cy));
+    player.draw(cx,cy);
+    enemies.forEach(e=>e.draw(cx,cy));
+    bullets.forEach(b=>b.draw(cx,cy));
+    if(marker){ctx.fillStyle='#ff0';ctx.beginPath();ctx.arc(marker.x-cx,marker.y-cy,20,0,Math.PI*2);ctx.fill();}
+    if(friend && friend.visible) ctx.drawImage(imgs['friend.png'],friend.x-cx-friend.w/2,friend.y-cy-friend.h/2,friend.w,friend.h);
+
+    ctx.fillStyle='#fff';ctx.font='24px Arial';ctx.textAlign='left';
+    ctx.fillText(`Kills: ${kills}/${KILL_GOAL}`,20,40);
+    drawHP(); drawMinimap();
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ───────────────────── CONTROLS (JOYSTICK FIXED) ───────────────────── */
+function setupControls(){
+  document.querySelectorAll('.arrow').forEach(b=>{const d=b.id;
+    b.addEventListener('touchstart',e=>{e.preventDefault();keys[d]=true;});
+    b.addEventListener('touchend',e=>{e.preventDefault();keys[d]=false;});
+    b.addEventListener('mousedown',()=>{keys[d]=true;});
+    b.addEventListener('mouseup',()=>{keys[d]=false;});
+  });
+  addEventListener('keydown',e=>{
+    if(e.key==='ArrowUp'||e.key==='w')keys.up=true;
+    if(e.key==='ArrowDown'||e.key==='s')keys.down=true;
+    if(e.key==='ArrowLeft'||e.key==='a')keys.left=true;
+    if(e.key==='ArrowRight'||e.key==='d')keys.right=true;
+  });
+  addEventListener('keyup',e=>{keys.up=keys.down=keys.left=keys.right=false;});
+
+  const cont=document.getElementById('joystick-container');
+  const knob=document.getElementById('joystick-knob');
+  const start=(e,touch=null)=>{
+    e.preventDefault();
+    const rect=cont.getBoundingClientRect();
+    joy.bx=rect.left+rect.width/2;
+    joy.by=rect.top+rect.height/2;
+    joy.active=true;
+    joy.id=touch?.identifier??'mouse';
+    const x=touch?touch.clientX:e.clientX, y=touch?touch.clientY:e.clientY;
+    updateJoystick(x,y);
+  };
+  const move=(e,touch=null)=>{
+    if(!joy.active) return;
+    e.preventDefault();
+    const x=touch?touch.clientX:e.clientX, y=touch?touch.clientY:e.clientY;
+    if(joy.id===touch?.identifier||joy.id==='mouse') updateJoystick(x,y);
+  };
+  const end=()=>{
+    joy.active=false;
+    joy.power=0;
+    joy.id=null;
+    player.shooting=false;
+    knob.style.transform='translate(0,0)';
+  };
+  const updateJoystick=(x,y)=>{
+    const dx=x-joy.bx, dy=y-joy.by, dist=Math.hypot(dx,dy), max=50;
+    joy.angle=Math.atan2(dy,dx);
+    joy.power=Math.min(dist/max,1);
+    const moveX=Math.cos(joy.angle)*Math.min(dist,max);
+    const moveY=Math.sin(joy.angle)*Math.min(dist,max);
+    knob.style.transform=`translate(${moveX}px,${moveY}px)`;
+    player.shooting=joy.power>0.3;
+  };
+
+  cont.addEventListener('touchstart',e=>start(e,e.changedTouches[0]));
+  document.addEventListener('touchmove',e=>{
+    for(let t of e.changedTouches) if(t.identifier===joy.id) move(e,t);
+  });
+  document.addEventListener('touchend',e=>{
+    for(let t of e.changedTouches) if(t.identifier===joy.id) end();
+  });
+  cont.addEventListener('mousedown',start);
+  document.addEventListener('mousemove',move);
+  document.addEventListener('mouseup',end);
+
+  const tap=e=>{if(state==='start'){e.preventDefault();startGame();}};
+  canvas.addEventListener('click',tap);
+  canvas.addEventListener('touchstart',tap);
+}
+setupControls();
+</script>
+</body>
+</html>
